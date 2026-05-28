@@ -47,6 +47,7 @@ RTSP_URLS    = [u.strip() for u in cfg_get("camera", "rtsp_urls").split(",") if 
 MODEL_PATH   = cfg_get("detection", "model", "yolov8n.pt")
 CONF_THRES   = float(cfg_get("detection", "confidence", "0.50"))
 DETECT_FPS   = int(cfg_get("detection", "detect_fps", "5"))
+REGION_RAW   = cfg_get("detection", "region", "")
 COOLDOWN     = int(cfg_get("alert", "cooldown_seconds", "15"))
 SHOW_WINDOW  = cfg_get("alert", "show_window", "True").lower() == "true"
 SAVE_SHOTS   = cfg_get("alert", "save_screenshots", "True").lower() == "true"
@@ -71,6 +72,66 @@ print_lock = threading.Lock()
 def log(msg):
     with print_lock:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def parse_region_spec(raw_value):
+    if not raw_value:
+        return None
+    try:
+        parts = [p.strip() for p in raw_value.split(",")]
+        if len(parts) != 4:
+            raise ValueError("need 4 numbers")
+        return tuple(float(p) for p in parts)
+    except Exception:
+        print("[WARN] Invalid detection.region in config.ini, fallback to full frame")
+        return None
+
+REGION_SPEC = parse_region_spec(REGION_RAW)
+
+def resolve_region(frame_shape, region_spec):
+    h, w = frame_shape[:2]
+    if not region_spec:
+        return (0, 0, w, h)
+
+    use_ratio = all(0.0 <= v <= 1.0 for v in region_spec)
+    if use_ratio:
+        x1 = int(round(region_spec[0] * w))
+        y1 = int(round(region_spec[1] * h))
+        x2 = int(round(region_spec[2] * w))
+        y2 = int(round(region_spec[3] * h))
+    else:
+        x1, y1, x2, y2 = [int(round(v)) for v in region_spec]
+
+    x1 = max(0, min(x1, w - 1))
+    y1 = max(0, min(y1, h - 1))
+    x2 = max(1, min(x2, w))
+    y2 = max(1, min(y2, h))
+
+    if x2 <= x1 or y2 <= y1:
+        return (0, 0, w, h)
+    return (x1, y1, x2, y2)
+
+def draw_detection_overlay(frame, region_rect, boxes_xyxy=None, confs=None):
+    annotated = frame.copy()
+    rx1, ry1, rx2, ry2 = region_rect
+
+    cv2.rectangle(annotated, (rx1, ry1), (rx2 - 1, ry2 - 1), (0, 215, 255), 2)
+    label_y = ry1 - 10 if ry1 > 28 else ry1 + 24
+    cv2.putText(annotated, "Detection Region",
+                (rx1 + 4, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 215, 255), 2)
+
+    if boxes_xyxy and confs:
+        for (x1, y1, x2, y2), conf in zip(boxes_xyxy, confs):
+            x1 = int(round(x1 + rx1))
+            y1 = int(round(y1 + ry1))
+            x2 = int(round(x2 + rx1))
+            y2 = int(round(y2 + ry1))
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 80), 2)
+            cv2.putText(annotated, f"person {conf:.0%}",
+                        (x1, max(22, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 80), 2)
+
+    return annotated
 
 def write_log_csv(cam_name, count, conf, shot_path):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -188,6 +249,7 @@ def camera_thread(rtsp_url, cam_index, model):
     last_alert  = 0
     frame_gap   = 1.0 / DETECT_FPS
     last_detect = 0
+    region_logged = False
 
     log(f"[{cam_name}] Connecting: {rtsp_url}")
 
@@ -215,11 +277,18 @@ def camera_thread(rtsp_url, cam_index, model):
             fail_count = 0
 
             now = time.time()
+            region_rect = resolve_region(frame.shape, REGION_SPEC)
+
+            if not region_logged:
+                rx1, ry1, rx2, ry2 = region_rect
+                region_mode = "full frame" if not REGION_SPEC else ("ratio" if all(0.0 <= v <= 1.0 for v in REGION_SPEC) else "pixel")
+                log(f"[{cam_name}] Detection region: ({rx1},{ry1})-({rx2},{ry2}) mode={region_mode}")
+                region_logged = True
 
             # Throttle to detect_fps
             if now - last_detect < frame_gap:
                 if SHOW_WINDOW:
-                    cv2.imshow(cam_name, frame)
+                    cv2.imshow(cam_name, draw_detection_overlay(frame, region_rect))
                     key = cv2.waitKey(1) & 0xFF
                     if key in (ord('q'), 27):
                         shutdown("(Q/ESC pressed)")
@@ -227,11 +296,15 @@ def camera_thread(rtsp_url, cam_index, model):
 
             last_detect = now
 
-            results  = model(frame, classes=[0], conf=CONF_THRES, verbose=False)
+            rx1, ry1, rx2, ry2 = region_rect
+            region_frame = frame[ry1:ry2, rx1:rx2]
+            results  = model(region_frame, classes=[0], conf=CONF_THRES, verbose=False)
             boxes    = results[0].boxes
             persons  = len(boxes)
             max_conf = float(boxes.conf.max()) if persons > 0 else 0.0
-            annotated = results[0].plot() if (SHOW_WINDOW or SAVE_SHOTS) else None
+            boxes_xyxy = boxes.xyxy.cpu().tolist() if persons > 0 else []
+            confs = boxes.conf.cpu().tolist() if persons > 0 else []
+            annotated = draw_detection_overlay(frame, region_rect, boxes_xyxy, confs) if (SHOW_WINDOW or SAVE_SHOTS) else None
 
             if persons > 0 and (now - last_alert) >= COOLDOWN:
                 last_alert = now

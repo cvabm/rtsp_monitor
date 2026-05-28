@@ -27,6 +27,7 @@ pip install requests pillow -q
 
 echo.
 echo [OK] All dependencies installed successfully!
-echo Now you can run "start_monitor.bat"
+echo Recommended: run "start.bat"
+echo You can also run "start_monitor.bat" or "start_region_selector.bat" directly
 echo.
 pause
