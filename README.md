@@ -48,7 +48,7 @@ rtsp_monitor/
 ├── region_selector.py  ← 区域框选工具
 ├── config.ini          ← 配置文件（改这里）
 ├── alert_log.csv       ← 告警日志（自动生成）
-└── alerts/             ← 截图保存目录（自动生成）
+└── alerts/             ← 截图/告警短录像目录（自动生成）
 ```
 
 ---
@@ -67,6 +67,12 @@ rtsp_monitor/
 | save_screenshots | 是否保存告警截图 | True |
 | wecom_webhook | 企业微信机器人地址（留空不推送）| — |
 | dingtalk_webhook | 钉钉机器人地址（留空不推送）| — |
+| recording.enabled | 告警触发短录像开关 | False |
+| recording.record_dir | 录像保存目录 | alerts |
+| recording.pre_seconds | 告警前保留秒数（内存环形缓冲） | 10 |
+| recording.post_seconds | 人离开画面后再录多少秒再停；人还在就一直录 | 15 |
+| recording.fps | 录像写入帧率 | 10 |
+| recording.codec | OpenCV FourCC（Windows 推荐 mp4v） | mp4v |
 
 ---
 

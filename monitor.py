@@ -16,6 +16,7 @@ import requests
 import traceback
 import signal
 import sys
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from ultralytics import YOLO
@@ -58,13 +59,22 @@ WECOM_HOOK   = cfg_get("notification", "wecom_webhook", "")
 DD_HOOK      = cfg_get("notification", "dingtalk_webhook", "")
 SOUND_ALERT  = cfg_get("notification", "sound_alert", "True").lower() == "true"
 
+REC_ENABLED  = cfg_get("recording", "enabled", "False").lower() == "true"
+REC_DIR      = cfg_get("recording", "record_dir", "alerts")
+PRE_SECONDS  = max(0, int(cfg_get("recording", "pre_seconds", "10")))
+POST_SECONDS = max(0, int(cfg_get("recording", "post_seconds", "15")))
+REC_FPS      = max(1, int(cfg_get("recording", "fps", "10")))
+REC_CODEC    = cfg_get("recording", "codec", "mp4v") or "mp4v"
+
 if SAVE_SHOTS:
     Path(SHOT_DIR).mkdir(exist_ok=True)
+if REC_ENABLED:
+    Path(REC_DIR).mkdir(exist_ok=True)
 
 LOG_FILE = "alert_log.csv"
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", encoding="utf-8") as f:
-        f.write("time,camera,persons,confidence,screenshot\n")
+        f.write("time,camera,persons,confidence,screenshot,video\n")
 
 # -- Logging -------------------------------------------
 print_lock = threading.Lock()
@@ -133,28 +143,79 @@ def draw_detection_overlay(frame, region_rect, boxes_xyxy=None, confs=None):
 
     return annotated
 
-def write_log_csv(cam_name, count, conf, shot_path):
+def write_log_csv(cam_name, count, conf, shot_path, video_path=""):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{ts},{cam_name},{count},{conf:.3f},{shot_path}\n")
+        f.write(f"{ts},{cam_name},{count},{conf:.3f},{shot_path},{video_path}\n")
 
 # -- Windows Popup -------------------------------------
+# 这台系统的气泡只剩托盘黄图标，文字出不来。改成右下角带文字的提示。
+_POPUP_PS = r"""
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$titleText = [string]$env:RTSP_ALERT_TITLE
+$bodyText = [string]$env:RTSP_ALERT_MSG
+$ms = 6000
+if ($env:RTSP_ALERT_MS) { $ms = [int]$env:RTSP_ALERT_MS }
+$form = New-Object System.Windows.Forms.Form
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$form.TopMost = $true
+$form.ShowInTaskbar = $false
+$form.BackColor = [System.Drawing.Color]::FromArgb(32, 32, 32)
+$form.ClientSize = New-Object System.Drawing.Size(360, 96)
+$area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+$form.Location = New-Object System.Drawing.Point(($area.Right - $form.Width - 12), ($area.Bottom - $form.Height - 12))
+$icon = New-Object System.Windows.Forms.PictureBox
+$icon.Image = [System.Drawing.SystemIcons]::Warning.ToBitmap()
+$icon.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::CenterImage
+$icon.Location = New-Object System.Drawing.Point(12, 28)
+$icon.Size = New-Object System.Drawing.Size(32, 32)
+$icon.BackColor = $form.BackColor
+$titleLabel = New-Object System.Windows.Forms.Label
+$titleLabel.Text = $titleText
+$titleLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11, [System.Drawing.FontStyle]::Bold)
+$titleLabel.ForeColor = [System.Drawing.Color]::White
+$titleLabel.AutoSize = $false
+$titleLabel.Location = New-Object System.Drawing.Point(56, 14)
+$titleLabel.Size = New-Object System.Drawing.Size(290, 26)
+$body = New-Object System.Windows.Forms.Label
+$body.Text = $bodyText
+$body.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+$body.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+$body.AutoSize = $false
+$body.Location = New-Object System.Drawing.Point(56, 44)
+$body.Size = New-Object System.Drawing.Size(290, 42)
+$form.Controls.Add($icon)
+$form.Controls.Add($titleLabel)
+$form.Controls.Add($body)
+$close = { $form.Close() }
+$form.Add_Click($close)
+$icon.Add_Click($close)
+$titleLabel.Add_Click($close)
+$body.Add_Click($close)
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = [Math]::Max(1000, $ms)
+$timer.Add_Tick({ $timer.Stop(); $form.Close() })
+$form.Add_Shown({ $timer.Start(); $form.TopMost = $true })
+[void]$form.ShowDialog()
+"""
+
 def windows_toast(title, msg, duration=6):
     if stop_event.is_set():
         return
     try:
-        st = title.replace("'", "")
-        sm = msg.replace("'", "").replace("\n", " | ")
-        ps = (f"Add-Type -AssemblyName System.Windows.Forms;"
-              f"$n=New-Object System.Windows.Forms.NotifyIcon;"
-              f"$n.Icon=[System.Drawing.SystemIcons]::Warning;"
-              f"$n.Visible=$true;"
-              f"$n.ShowBalloonTip({duration*1000},'{st}','{sm}',"
-              f"[System.Windows.Forms.ToolTipIcon]::Warning);"
-              f"Start-Sleep -Seconds {duration+1};$n.Dispose()")
         import subprocess
-        subprocess.Popen(["powershell","-WindowStyle","Hidden","-Command",ps],
-                         creationflags=0x08000000)
+        env = os.environ.copy()
+        env["RTSP_ALERT_TITLE"] = title.replace("\n", " ")
+        env["RTSP_ALERT_MSG"] = msg.replace("\n", " | ")
+        env["RTSP_ALERT_MS"] = str(max(1, int(duration)) * 1000)
+        subprocess.Popen(
+            ["powershell", "-STA", "-NoProfile", "-Command", _POPUP_PS],
+            creationflags=0x08000000,
+            env=env,
+        )
+        log("[Popup] alert card started")
     except Exception:
         try:
             ctypes.windll.user32.MessageBoxW(0, msg, title, 0x00001030)
@@ -214,17 +275,17 @@ def alert_worker():
         except queue.Empty:
             continue
         try:
-            cam_name, count, conf, annotated_frame = item
+            cam_name, count, conf, annotated_frame, video_path = item
             shot_path = ""
             if SAVE_SHOTS and annotated_frame is not None:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 shot_path = os.path.join(SHOT_DIR, f"{cam_name}_{ts}_p{count}.jpg")
                 cv2.imwrite(shot_path, annotated_frame)
                 log(f"[Screenshot] Saved -> {shot_path}")
-            write_log_csv(cam_name, count, conf, shot_path)
-            title = "Person Detected - Security Alert"
-            msg   = (f"Camera {cam_name}: {count} person(s) detected\n"
-                     f"Confidence {conf:.0%}  {datetime.now().strftime('%H:%M:%S')}")
+            write_log_csv(cam_name, count, conf, shot_path, video_path or "")
+            title = "发现人员"
+            msg   = (f"{cam_name} 检测到 {count} 人\n"
+                     f"置信度 {conf:.0%}  {datetime.now().strftime('%H:%M:%S')}")
             tasks = []
             if WIN_POPUP:
                 tasks.append(threading.Thread(target=windows_toast, args=(title,msg,POPUP_DUR), daemon=True))
@@ -250,6 +311,86 @@ def camera_thread(rtsp_url, cam_index, model):
     frame_gap   = 1.0 / DETECT_FPS
     last_detect = 0
     region_logged = False
+
+    ring_maxlen = max(1, int(PRE_SECONDS * REC_FPS))
+    ring = deque(maxlen=ring_maxlen)
+    rec_interval = 1.0 / REC_FPS
+    last_rec_t = 0.0
+    writer = None
+    rec_path = ""
+    rec_end_t = 0.0
+    rec_size = None  # (w, h)
+
+    def close_writer(save=True):
+        nonlocal writer, rec_path, rec_end_t, rec_size
+        if writer is None:
+            return
+        path = rec_path
+        try:
+            writer.release()
+        except Exception:
+            pass
+        writer = None
+        rec_end_t = 0.0
+        rec_size = None
+        if save and path:
+            log(f"[{cam_name}] Recording saved -> {path}")
+        elif path and not save:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+            log(f"[{cam_name}] Recording discarded (reconnect)")
+        rec_path = ""
+
+    def begin_recording(frame_shape, persons):
+        nonlocal writer, rec_path, rec_end_t, rec_size
+        if writer is not None:
+            return rec_path
+        h, w = frame_shape[:2]
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(REC_DIR, f"{cam_name}_{ts}_p{persons}.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*REC_CODEC[:4].ljust(4, " "))
+        vw = cv2.VideoWriter(path, fourcc, float(REC_FPS), (w, h))
+        if not vw.isOpened():
+            log(f"[{cam_name}] Failed to open VideoWriter -> {path}")
+            try:
+                vw.release()
+            except Exception:
+                pass
+            return ""
+        writer = vw
+        rec_path = path
+        rec_size = (w, h)
+        for buffered in list(ring):
+            bf = buffered
+            if bf.shape[1] != w or bf.shape[0] != h:
+                bf = cv2.resize(bf, (w, h))
+            writer.write(bf)
+        ring.clear()
+        rec_end_t = time.time() + POST_SECONDS
+        log(f"[{cam_name}] Recording started -> {path} "
+            f"(pre={PRE_SECONDS}s, stop {POST_SECONDS}s after person leaves)")
+        return path
+
+    def push_record_frame(frame, now):
+        nonlocal last_rec_t
+        if not REC_ENABLED or frame is None:
+            return
+        if now - last_rec_t < rec_interval:
+            return
+        last_rec_t = now
+        out = frame
+        if writer is not None:
+            w, h = rec_size
+            if out.shape[1] != w or out.shape[0] != h:
+                out = cv2.resize(out, (w, h))
+            writer.write(out)
+            if stop_event.is_set():
+                close_writer(save=True)
+        else:
+            ring.append(out.copy())
 
     log(f"[{cam_name}] Connecting: {rtsp_url}")
 
@@ -287,8 +428,10 @@ def camera_thread(rtsp_url, cam_index, model):
 
             # Throttle to detect_fps
             if now - last_detect < frame_gap:
-                if SHOW_WINDOW:
-                    cv2.imshow(cam_name, draw_detection_overlay(frame, region_rect))
+                overlay = draw_detection_overlay(frame, region_rect) if (SHOW_WINDOW or REC_ENABLED) else None
+                push_record_frame(overlay, now)
+                if SHOW_WINDOW and overlay is not None:
+                    cv2.imshow(cam_name, overlay)
                     key = cv2.waitKey(1) & 0xFF
                     if key in (ord('q'), 27):
                         shutdown("(Q/ESC pressed)")
@@ -304,12 +447,24 @@ def camera_thread(rtsp_url, cam_index, model):
             max_conf = float(boxes.conf.max()) if persons > 0 else 0.0
             boxes_xyxy = boxes.xyxy.cpu().tolist() if persons > 0 else []
             confs = boxes.conf.cpu().tolist() if persons > 0 else []
-            annotated = draw_detection_overlay(frame, region_rect, boxes_xyxy, confs) if (SHOW_WINDOW or SAVE_SHOTS) else None
+            need_annot = SHOW_WINDOW or SAVE_SHOTS or REC_ENABLED
+            annotated = draw_detection_overlay(frame, region_rect, boxes_xyxy, confs) if need_annot else None
 
+            video_path = ""
             if persons > 0 and (now - last_alert) >= COOLDOWN:
                 last_alert = now
                 log(f"[{cam_name}] ALERT! {persons} person(s), conf {max_conf:.0%}")
-                alert_queue.put((cam_name, persons, max_conf, annotated))
+                if REC_ENABLED and annotated is not None:
+                    video_path = begin_recording(annotated.shape, persons)
+                alert_queue.put((cam_name, persons, max_conf, annotated, video_path))
+
+            if writer is not None and persons > 0:
+                rec_end_t = now + POST_SECONDS
+
+            push_record_frame(annotated, now)
+
+            if writer is not None and persons == 0 and now >= rec_end_t:
+                close_writer(save=True)
 
             if SHOW_WINDOW and annotated is not None:
                 color = (0, 255, 80) if persons > 0 else (200, 200, 200)
@@ -323,10 +478,14 @@ def camera_thread(rtsp_url, cam_index, model):
                 if key in (ord('q'), 27):
                     shutdown("(Q/ESC pressed)")
 
+        close_writer(save=False)
+        ring.clear()
         cap.release()
         if not stop_event.is_set():
             stop_event.wait(2)
 
+    close_writer(save=True)
+    ring.clear()
     log(f"[{cam_name}] Thread stopped.")
 
 # -- Main ----------------------------------------------
@@ -341,6 +500,10 @@ def main():
     print(f"  Detect FPS : {DETECT_FPS}")
     print(f"  Show window: {SHOW_WINDOW}")
     print(f"  Screenshots: {SAVE_SHOTS}")
+    if REC_ENABLED:
+        print(f"  Recording  : ON  pre={PRE_SECONDS}s, stop {POST_SECONDS}s after person leaves @ {REC_FPS}fps")
+    else:
+        print(f"  Recording  : OFF")
     print("=" * 52)
     print("  HOW TO QUIT:")
     print("    - Press Q or ESC in the video window, OR")
